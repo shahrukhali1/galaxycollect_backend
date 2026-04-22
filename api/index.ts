@@ -6,12 +6,8 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
-import { v2 as cloudinary } from 'cloudinary';
-import multer from 'multer';
-import { CloudinaryStorage } from 'multer-storage-cloudinary';
 import Blog from './models/Blog.ts';
 import Product from './models/Product.ts';
-import { GoogleGenAI } from '@google/genai';
 
 dotenv.config();
 mongoose.set('strictQuery', true);
@@ -21,27 +17,6 @@ const hasCloudinaryConfig = Boolean(
   process.env.CLOUDINARY_API_KEY &&
   process.env.CLOUDINARY_API_SECRET
 );
-
-if (hasCloudinaryConfig) {
-  cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET
-  });
-}
-
-const upload = hasCloudinaryConfig
-  ? multer({
-      storage: new CloudinaryStorage({
-        cloudinary: cloudinary,
-        params: async (_req, file) => ({
-          folder: 'zfour_collections',
-          format: 'webp',
-          public_id: `${Date.now()}-${file.originalname.split('.')[0]}`,
-        }),
-      }),
-    })
-  : null;
 
 const app = express();
 app.disable('x-powered-by');
@@ -99,8 +74,60 @@ const createSimpleCache = <T>(ttlMs: number) => {
 
 const blogListCache = createSimpleCache<any[]>(15_000);
 const productListCache = createSimpleCache<any[]>(15_000);
-const geminiApiKey = process.env.GEMINI_API_KEY;
-const genAI = geminiApiKey ? new GoogleGenAI({ apiKey: geminiApiKey }) : null;
+let uploadMiddlewarePromise: Promise<any> | null = null;
+let genAIClientPromise: Promise<any> | null = null;
+
+const getUploadMiddleware = async () => {
+  if (!hasCloudinaryConfig) return null;
+  if (!uploadMiddlewarePromise) {
+    uploadMiddlewarePromise = (async () => {
+      const [{ v2: cloudinary }, multerModule, cloudinaryStorageModule] = await Promise.all([
+        import('cloudinary'),
+        import('multer'),
+        import('multer-storage-cloudinary')
+      ]);
+      const multer = multerModule.default;
+      const { CloudinaryStorage } = cloudinaryStorageModule;
+
+      cloudinary.config({
+        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+        api_key: process.env.CLOUDINARY_API_KEY,
+        api_secret: process.env.CLOUDINARY_API_SECRET
+      });
+
+      return multer({
+        storage: new CloudinaryStorage({
+          cloudinary,
+          params: async (_req: any, file: any) => ({
+            folder: 'zfour_collections',
+            format: 'webp',
+            public_id: `${Date.now()}-${file.originalname.split('.')[0]}`
+          })
+        })
+      });
+    })().catch((error) => {
+      uploadMiddlewarePromise = null;
+      throw error;
+    });
+  }
+
+  return uploadMiddlewarePromise;
+};
+
+const getGenAIClient = async () => {
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  if (!geminiApiKey) return null;
+  if (!genAIClientPromise) {
+    genAIClientPromise = import('@google/genai')
+      .then(({ GoogleGenAI }) => new GoogleGenAI({ apiKey: geminiApiKey }))
+      .catch((error) => {
+        genAIClientPromise = null;
+        throw error;
+      });
+  }
+
+  return genAIClientPromise;
+};
 
 app.use(cors({
   origin: (origin, callback) => {
@@ -288,9 +315,14 @@ app.delete('/api/products/:id', async (req, res) => {
   }
 });
 
-app.post('/api/upload', (req: any, res: any, next: any) => {
-  if (!upload) return res.status(500).json({ error: 'Cloudinary is not configured on the server.' });
-  upload.single('image')(req, res, next);
+app.post('/api/upload', async (req: any, res: any, next: any) => {
+  try {
+    const upload = await getUploadMiddleware();
+    if (!upload) return res.status(500).json({ error: 'Cloudinary is not configured on the server.' });
+    upload.single('image')(req, res, next);
+  } catch (error: any) {
+    return res.status(500).json({ error: error.message || 'Upload service is unavailable.' });
+  }
 }, (req: any, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   res.json({ url: req.file.path });
@@ -298,6 +330,7 @@ app.post('/api/upload', (req: any, res: any, next: any) => {
 
 app.post('/api/chat', async (req, res) => {
   const { message, history } = req.body;
+  const genAI = await getGenAIClient();
   if (!genAI) return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
 
   try {
