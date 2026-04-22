@@ -3,15 +3,15 @@
   "rewrites": [
     {
       "source": "/",
-      "destination": "/api/[...all].ts"
+      "destination": "/api/[...all].js"
     },
     {
       "source": "/api/(.*)",
-      "destination": "/api/[...all].ts"
+      "destination": "/api/[...all].js"
     },
     {
       "source": "/auth/(.*)",
-      "destination": "/api/[...all].ts"
+      "destination": "/api/[...all].js"
     }
   ]
 }
