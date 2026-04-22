@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/[...all].ts"
+    },
+    {
+      "source": "/auth/(.*)",
+      "destination": "/api/[...all].ts"
+    }
+  ]
+}
