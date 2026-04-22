@@ -1,5 +1,10 @@
 {
   "version": 2,
+  "functions": {
+    "api/[...all].ts": {
+      "runtime": "nodejs20.x"
+    }
+  },
   "rewrites": [
     {
       "source": "/",
