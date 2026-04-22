@@ -6,8 +6,10 @@ import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 import Blog from './models/Blog.js';
 import Product from './models/Product.js';
+import User from './models/User.js';
 
 dotenv.config();
 mongoose.set('strictQuery', true);
@@ -76,6 +78,63 @@ const blogListCache = createSimpleCache(15_000);
 const productListCache = createSimpleCache(15_000);
 let uploadMiddlewarePromise = null;
 let genAIClientPromise = null;
+const loginAttempts = new Map();
+const LOGIN_RATE_LIMIT_WINDOW_MS = Number(process.env.LOGIN_RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000);
+const LOGIN_RATE_LIMIT_MAX_ATTEMPTS = Number(process.env.LOGIN_RATE_LIMIT_MAX_ATTEMPTS || 5);
+const LOGIN_LOCK_DURATION_MS = Number(process.env.LOGIN_LOCK_DURATION_MS || 30 * 60 * 1000);
+
+const makeError = (error, code, message) => ({ error, code, message });
+const toPublicUser = (user) => ({
+  id: String(user._id),
+  name: user.name,
+  email: user.email,
+  role: user.role
+});
+
+const consumeLoginAttempt = (ip, email) => {
+  const key = `${ip}:${email}`;
+  const now = Date.now();
+  const attempt = loginAttempts.get(key);
+
+  if (!attempt || now > attempt.resetAt) {
+    loginAttempts.set(key, { count: 1, resetAt: now + LOGIN_RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  attempt.count += 1;
+  loginAttempts.set(key, attempt);
+  return attempt.count > LOGIN_RATE_LIMIT_MAX_ATTEMPTS;
+};
+
+const clearLoginAttempt = (ip, email) => {
+  loginAttempts.delete(`${ip}:${email}`);
+};
+
+const getSessionUser = (req) => req.session?.authUser || null;
+
+const requireSuperAdmin = (req, res, next) => {
+  const user = getSessionUser(req);
+  if (!user) {
+    return res.status(401).json(makeError('Unauthorized', 'UNAUTHORIZED', 'Authentication required'));
+  }
+  if (user.role !== 'super_admin') {
+    return res.status(403).json(makeError('Forbidden', 'FORBIDDEN', 'Super admin access required'));
+  }
+  return next();
+};
+
+const auditAdminAction = (action) => (req, _res, next) => {
+  const actor = getSessionUser(req);
+  console.info('[ADMIN_AUDIT]', {
+    action,
+    userId: actor?.id || null,
+    email: actor?.email || null,
+    method: req.method,
+    path: req.originalUrl,
+    at: new Date().toISOString()
+  });
+  next();
+};
 
 const getUploadMiddleware = async () => {
   if (!hasCloudinaryConfig) return null;
@@ -144,7 +203,7 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
+    sameSite: process.env.NODE_ENV === 'production' ? (process.env.SESSION_COOKIE_SAME_SITE || 'lax') : 'lax',
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000
   }
@@ -177,7 +236,64 @@ app.get('/', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend is running' });
 });
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', env: process.env.NODE_ENV }));
-app.get('/api/auth/user', (req, res) => res.json(req.user || null));
+app.get('/api/auth/user', (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json(makeError('Unauthorized', 'UNAUTHORIZED', 'Unauthorized'));
+  return res.json(user);
+});
+
+app.post('/api/auth/super-admin/login', async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+
+    if (!email || !password) {
+      return res.status(401).json(makeError('Unauthorized', 'INVALID_CREDENTIALS', 'Invalid email or password'));
+    }
+
+    const tooManyAttempts = consumeLoginAttempt(req.ip, email);
+    if (tooManyAttempts) {
+      return res.status(429).json(makeError('Too Many Requests', 'TOO_MANY_ATTEMPTS', 'Too many login attempts'));
+    }
+
+    await connectToDatabase();
+    const user = await User.findOne({ email });
+    const isPasswordValid = user ? await bcrypt.compare(password, user.passwordHash) : false;
+    if (!user || !isPasswordValid) {
+      if (user) {
+        const failures = (user.loginFailures || 0) + 1;
+        const shouldLock = failures >= LOGIN_RATE_LIMIT_MAX_ATTEMPTS;
+        await User.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              loginFailures: failures,
+              ...(shouldLock ? { lockedUntil: new Date(Date.now() + LOGIN_LOCK_DURATION_MS) } : {})
+            }
+          }
+        );
+      }
+      return res.status(401).json(makeError('Unauthorized', 'INVALID_CREDENTIALS', 'Invalid email or password'));
+    }
+
+    if (user.lockedUntil && user.lockedUntil.getTime() > Date.now()) {
+      return res.status(429).json(makeError('Too Many Requests', 'ACCOUNT_LOCKED', 'Account temporarily locked'));
+    }
+
+    if (user.role !== 'super_admin') {
+      return res.status(403).json(makeError('Forbidden', 'FORBIDDEN', 'Super admin access required'));
+    }
+
+    const sessionUser = toPublicUser(user);
+    req.session.authUser = sessionUser;
+    clearLoginAttempt(req.ip, email);
+    await User.updateOne({ _id: user._id }, { $set: { loginFailures: 0, lockedUntil: null } });
+
+    return res.status(200).json({ ok: true, user: sessionUser });
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
 
 app.get('/api/auth/google/url', (req, res) => {
   if (!process.env.GOOGLE_CLIENT_ID) return res.status(500).json({ error: 'Google Client ID not configured' });
@@ -206,8 +322,12 @@ app.get(['/auth/google/callback', '/auth/google/callback/'],
 
 app.post('/api/auth/logout', (req, res) => {
   req.logout((err) => {
-    if (err) return res.status(500).json({ error: 'Logout failed' });
-    res.json({ success: true });
+    if (err) return res.status(500).json(makeError('Internal Server Error', 'LOGOUT_FAILED', 'Logout failed'));
+    req.session.destroy((sessionErr) => {
+      if (sessionErr) return res.status(500).json(makeError('Internal Server Error', 'LOGOUT_FAILED', 'Logout failed'));
+      res.clearCookie('connect.sid');
+      return res.status(200).json({ ok: true });
+    });
   });
 });
 
@@ -225,7 +345,7 @@ app.get('/api/blogs', async (_req, res) => {
   }
 });
 
-app.post('/api/blogs', async (req, res) => {
+app.post('/api/blogs', requireSuperAdmin, auditAdminAction('blog_create'), async (req, res) => {
   try {
     await connectToDatabase();
     const newBlog = new Blog(req.body);
@@ -237,7 +357,7 @@ app.post('/api/blogs', async (req, res) => {
   }
 });
 
-app.put('/api/blogs/:id', async (req, res) => {
+app.put('/api/blogs/:id', requireSuperAdmin, auditAdminAction('blog_update'), async (req, res) => {
   try {
     await connectToDatabase();
     const updatedBlog = await Blog.findOneAndUpdate(
@@ -252,7 +372,7 @@ app.put('/api/blogs/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/blogs/:id', async (req, res) => {
+app.delete('/api/blogs/:id', requireSuperAdmin, auditAdminAction('blog_delete'), async (req, res) => {
   try {
     await connectToDatabase();
     await Blog.findOneAndDelete({ _id: req.params.id });
@@ -277,7 +397,7 @@ app.get('/api/products', async (_req, res) => {
   }
 });
 
-app.post('/api/products', async (req, res) => {
+app.post('/api/products', requireSuperAdmin, auditAdminAction('product_create'), async (req, res) => {
   try {
     await connectToDatabase();
     const newProduct = new Product(req.body);
@@ -289,7 +409,7 @@ app.post('/api/products', async (req, res) => {
   }
 });
 
-app.put('/api/products/:id', async (req, res) => {
+app.put('/api/products/:id', requireSuperAdmin, auditAdminAction('product_update'), async (req, res) => {
   try {
     await connectToDatabase();
     const updatedProduct = await Product.findOneAndUpdate(
@@ -304,7 +424,7 @@ app.put('/api/products/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/products/:id', async (req, res) => {
+app.delete('/api/products/:id', requireSuperAdmin, auditAdminAction('product_delete'), async (req, res) => {
   try {
     await connectToDatabase();
     await Product.findOneAndDelete({ _id: req.params.id });
@@ -349,6 +469,8 @@ Keep replies concise (under 3 sentences unless asked for details).`,
     res.status(500).json({ error: 'Failed to generate AI response' });
   }
 });
+
+app.use('/api/admin/*', requireSuperAdmin);
 
 app.use('/api/*', (_req, res) => res.status(404).json({ error: 'Route not found' }));
 app.use((err, _req, res, _next) => res.status(500).json({ error: err.message || 'Internal Server Error' }));

@@ -6,10 +6,12 @@
     "node": ">=20.19.0"
   },
   "scripts": {
-    "dev": "tsx api/index.ts"
+    "dev": "tsx api/index.ts",
+    "seed:super-admin": "node scripts/seedSuperAdmin.js"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
+    "bcryptjs": "^3.0.2",
     "cloudinary": "^1.41.3",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.6",
