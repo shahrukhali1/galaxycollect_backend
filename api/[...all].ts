@@ -13,7 +13,7 @@ export default async function handler(req: any, res: any) {
   }
 
   try {
-    const { default: app } = await import('./index.ts');
+    const { default: app } = await import('./index');
     return app(req, res);
   } catch (error: any) {
     console.error('Function bootstrap error:', error);
