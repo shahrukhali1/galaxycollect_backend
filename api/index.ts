@@ -146,6 +146,9 @@ if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
   }));
 }
 
+app.get('/', (_req, res) => {
+  res.json({ status: 'ok', message: 'Backend is running' });
+});
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', env: process.env.NODE_ENV }));
 app.get('/api/auth/user', (req, res) => res.json(req.user || null));
 
