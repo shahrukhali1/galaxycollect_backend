@@ -1,5 +1,6 @@
 import express from 'express';
 import session from 'express-session';
+import MongoStore from 'connect-mongo';
 import passport from 'passport';
 import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import cors from 'cors';
@@ -10,6 +11,8 @@ import bcrypt from 'bcryptjs';
 import Blog from './models/Blog.js';
 import Product from './models/Product.js';
 import User from './models/User.js';
+import Order from './models/Order.js';
+import Banner from './models/Banner.js';
 
 dotenv.config();
 mongoose.set('strictQuery', true);
@@ -76,6 +79,7 @@ const createSimpleCache = (ttlMs) => {
 
 const blogListCache = createSimpleCache(15_000);
 const productListCache = createSimpleCache(15_000);
+const bannerListCache = createSimpleCache(30_000);
 let uploadMiddlewarePromise = null;
 let genAIClientPromise = null;
 const loginAttempts = new Map();
@@ -111,6 +115,11 @@ const clearLoginAttempt = (ip, email) => {
 };
 
 const getSessionUser = (req) => req.session?.authUser || null;
+const requireAuthenticatedUser = (req, res, next) => {
+  const user = getSessionUser(req);
+  if (!user) return res.status(401).json(makeError('Unauthorized', 'UNAUTHORIZED', 'Unauthorized'));
+  return next();
+};
 
 const requireSuperAdmin = (req, res, next) => {
   const user = getSessionUser(req);
@@ -199,11 +208,16 @@ app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 app.use(session({
   secret: process.env.SESSION_SECRET || 'zfour-secret-key',
+  store: process.env.MONGO_URI ? MongoStore.create({
+    mongoUrl: process.env.MONGO_URI,
+    ttl: 24 * 60 * 60,
+    autoRemove: 'native'
+  }) : undefined,
   resave: false,
   saveUninitialized: false,
   cookie: {
     secure: process.env.NODE_ENV === 'production',
-    sameSite: process.env.NODE_ENV === 'production' ? (process.env.SESSION_COOKIE_SAME_SITE || 'lax') : 'lax',
+    sameSite: process.env.NODE_ENV === 'production' ? (process.env.SESSION_COOKIE_SAME_SITE || 'none') : 'lax',
     httpOnly: true,
     maxAge: 24 * 60 * 60 * 1000
   }
@@ -325,7 +339,11 @@ app.post('/api/auth/logout', (req, res) => {
     if (err) return res.status(500).json(makeError('Internal Server Error', 'LOGOUT_FAILED', 'Logout failed'));
     req.session.destroy((sessionErr) => {
       if (sessionErr) return res.status(500).json(makeError('Internal Server Error', 'LOGOUT_FAILED', 'Logout failed'));
-      res.clearCookie('connect.sid');
+      res.clearCookie('connect.sid', {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === 'production',
+        sameSite: process.env.NODE_ENV === 'production' ? (process.env.SESSION_COOKIE_SAME_SITE || 'none') : 'lax'
+      });
       return res.status(200).json({ ok: true });
     });
   });
@@ -435,16 +453,134 @@ app.delete('/api/products/:id', requireSuperAdmin, auditAdminAction('product_del
   }
 });
 
-app.post('/api/upload', async (req, res, next) => {
+app.get('/api/banners', async (_req, res) => {
+  try {
+    const cachedBanners = bannerListCache.get();
+    if (cachedBanners) return res.json(cachedBanners);
+
+    await connectToDatabase();
+    const banners = await Banner.find({ isActive: true }).sort({ createdAt: -1 }).lean();
+    bannerListCache.set(banners);
+    return res.json(banners);
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.post('/api/orders', async (req, res) => {
+  try {
+    await connectToDatabase();
+    const payload = req.body || {};
+    const sessionUser = getSessionUser(req);
+    const customerId = sessionUser?.id || String(payload.customerId || '').trim();
+    const customerName = String(payload.customerName || '').trim();
+    const email = String(payload.email || sessionUser?.email || '').trim().toLowerCase();
+    const paymentMethod = String(payload.paymentMethod || '').trim();
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const shippingAddress = payload.shippingAddress || {};
+    const providedTotal = Number(payload.total);
+    const totalFromItems = items.reduce((sum, item) => {
+      const price = Number(item?.price || 0);
+      const quantity = Number(item?.quantity || 0);
+      return sum + (price * quantity);
+    }, 0);
+    const total = Number.isFinite(providedTotal) && providedTotal > 0 ? providedTotal : totalFromItems;
+
+    if (!customerId || !customerName || !email || !paymentMethod || !items.length || !shippingAddress?.address || !shippingAddress?.city || !shippingAddress?.zipCode || !shippingAddress?.phone) {
+      return res.status(400).json(makeError('Bad Request', 'VALIDATION_ERROR', 'Missing required order fields'));
+    }
+
+    const order = await Order.create({
+      orderId: `ORD-${Date.now()}${Math.floor(Math.random() * 1000)}`,
+      customerId,
+      customerName,
+      email,
+      items,
+      total,
+      status: String(payload.status || 'Pending'),
+      paymentMethod,
+      shippingAddress
+    });
+
+    return res.status(201).json({
+      id: String(order._id),
+      orderId: order.orderId,
+      customerId: order.customerId,
+      customerName: order.customerName,
+      email: order.email,
+      items: order.items,
+      total: order.total,
+      status: order.status,
+      paymentMethod: order.paymentMethod,
+      shippingAddress: order.shippingAddress,
+      createdAt: order.createdAt
+    });
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.get('/api/orders', requireSuperAdmin, auditAdminAction('order_list'), async (_req, res) => {
+  try {
+    await connectToDatabase();
+    const orders = await Order.find().sort({ createdAt: -1 }).lean();
+    return res.json(orders.map((order) => ({
+      id: String(order._id),
+      ...order
+    })));
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.get('/api/orders/my', requireAuthenticatedUser, async (req, res) => {
+  try {
+    await connectToDatabase();
+    const user = getSessionUser(req);
+    const orders = await Order.find({ customerId: user.id }).sort({ createdAt: -1 }).lean();
+    return res.json(orders.map((order) => ({
+      id: String(order._id),
+      ...order
+    })));
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.patch('/api/orders/:id/status', requireSuperAdmin, auditAdminAction('order_status_update'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const status = String(req.body?.status || '').trim();
+    if (!status) return res.status(400).json(makeError('Bad Request', 'VALIDATION_ERROR', 'Status is required'));
+    const updatedOrder = await Order.findByIdAndUpdate(req.params.id, { $set: { status } }, { new: true }).lean();
+    if (!updatedOrder) return res.status(404).json(makeError('Not Found', 'NOT_FOUND', 'Order not found'));
+    return res.json({ id: String(updatedOrder._id), ...updatedOrder });
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.delete('/api/orders/:id', requireSuperAdmin, auditAdminAction('order_delete'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const deletedOrder = await Order.findByIdAndDelete(req.params.id).lean();
+    if (!deletedOrder) return res.status(404).json(makeError('Not Found', 'NOT_FOUND', 'Order not found'));
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+  }
+});
+
+app.post('/api/upload', requireSuperAdmin, auditAdminAction('upload_create'), async (req, res, next) => {
   try {
     const upload = await getUploadMiddleware();
-    if (!upload) return res.status(500).json({ error: 'Cloudinary is not configured on the server.' });
+    if (!upload) return res.status(500).json(makeError('Internal Server Error', 'UPLOAD_UNAVAILABLE', 'Cloudinary is not configured on the server.'));
     upload.single('image')(req, res, next);
   } catch (error) {
-    return res.status(500).json({ error: error.message || 'Upload service is unavailable.' });
+    return res.status(500).json(makeError('Internal Server Error', 'UPLOAD_UNAVAILABLE', error.message || 'Upload service is unavailable.'));
   }
 }, (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  if (!req.file) return res.status(400).json(makeError('Bad Request', 'NO_FILE_UPLOADED', 'No file uploaded'));
   res.json({ url: req.file.path });
 });
 
