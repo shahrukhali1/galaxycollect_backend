@@ -9,7 +9,9 @@ const ProductSchema = new mongoose.Schema({
   fullDescription: { type: String, required: true },
   stockStatus: { type: String, default: 'In Stock' },
   quantity: { type: Number, required: true },
-  isTrending: { type: Boolean, default: false },
+  isBestSeller: { type: Boolean, default: false },
+  isNewArrival: { type: Boolean, default: false },
+  isSpecialOffer: { type: Boolean, default: false },
   status: { type: String, default: 'Active' }
 }, {
   timestamps: true

@@ -6,6 +6,8 @@ import { Strategy as GoogleStrategy } from 'passport-google-oauth20';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import dotenv from 'dotenv';
+import dns from 'dns';
+dns.setServers(['8.8.8.8']);
 import mongoose from 'mongoose';
 import bcrypt from 'bcryptjs';
 import Blog from './models/Blog.js';
@@ -13,6 +15,11 @@ import Product from './models/Product.js';
 import User from './models/User.js';
 import Order from './models/Order.js';
 import Banner from './models/Banner.js';
+import Category from './models/Category.js';
+import Wishlist from './models/Wishlist.js';
+import Coupon from './models/Coupon.js';
+import http from 'http';
+import { Server } from 'socket.io';
 
 dotenv.config();
 mongoose.set('strictQuery', true);
@@ -24,6 +31,26 @@ const hasCloudinaryConfig = Boolean(
 );
 
 const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+io.on('connection', (socket) => {
+  socket.on('join_chat', (userId) => {
+    socket.join(userId);
+  });
+
+  socket.on('send_message', (data) => {
+    // data: { senderId, receiverId, message, timestamp }
+    io.to(data.receiverId).emit('new_message', data);
+    io.to(data.senderId).emit('message_sent', data);
+  });
+});
+
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
 app.set('etag', 'strong');
@@ -48,7 +75,6 @@ async function connectToDatabase() {
 
   if (!dbConnectPromise) {
     dbConnectPromise = mongoose.connect(process.env.MONGO_URI, {
-      family: 4,
       maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE || 20),
       minPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE || 5),
       serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 5000),
@@ -80,6 +106,7 @@ const createSimpleCache = (ttlMs) => {
 const blogListCache = createSimpleCache(15_000);
 const productListCache = createSimpleCache(15_000);
 const bannerListCache = createSimpleCache(30_000);
+const categoryListCache = createSimpleCache(60_000);
 let uploadMiddlewarePromise = null;
 let genAIClientPromise = null;
 const loginAttempts = new Map();
@@ -198,13 +225,10 @@ const getGenAIClient = async () => {
 };
 
 app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || isAllowedOrigin(origin)) callback(null, true);
-    else callback(new Error('Not allowed by CORS'));
-  },
+  origin: true,
   credentials: true
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 app.use(session({
   secret: process.env.SESSION_SECRET || 'zfour-secret-key',
@@ -453,17 +477,65 @@ app.delete('/api/products/:id', requireSuperAdmin, auditAdminAction('product_del
   }
 });
 
-app.get('/api/banners', async (_req, res) => {
+app.get('/api/categories', async (_req, res) => {
   try {
-    const cachedBanners = bannerListCache.get();
-    if (cachedBanners) return res.json(cachedBanners);
+    const cached = categoryListCache.get();
+    if (cached) return res.json(cached);
 
     await connectToDatabase();
-    const banners = await Banner.find({ isActive: true }).sort({ createdAt: -1 }).lean();
-    bannerListCache.set(banners);
-    return res.json(banners);
+    const categories = await Category.find().sort({ name: 1 }).lean();
+    categoryListCache.set(categories);
+    res.json(categories);
   } catch (error) {
-    return res.status(500).json(makeError('Internal Server Error', 'INTERNAL_SERVER_ERROR', error.message));
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/categories', requireSuperAdmin, auditAdminAction('category_create'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const newCategory = new Category(req.body);
+    await newCategory.save();
+    categoryListCache.clear();
+    res.status(201).json(newCategory);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/categories/:id', requireSuperAdmin, auditAdminAction('category_update'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const updated = await Category.findByIdAndUpdate(
+      req.params.id,
+      { ...req.body, updatedAt: Date.now() },
+      { new: true }
+    );
+    categoryListCache.clear();
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/categories/:id', requireSuperAdmin, auditAdminAction('category_delete'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    await Category.findByIdAndDelete(req.params.id);
+    categoryListCache.clear();
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/banners', async (_req, res) => {
+  try {
+    await connectToDatabase();
+    const banners = await Banner.find({ isActive: true }).sort({ order: 1 }).lean();
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -499,7 +571,9 @@ app.post('/api/orders', async (req, res) => {
       total,
       status: String(payload.status || 'Pending'),
       paymentMethod,
-      shippingAddress
+      shippingAddress,
+      couponCode: String(payload.couponCode || '').trim(),
+      discountAmount: Number(payload.discountAmount || 0)
     });
 
     return res.status(201).json({
@@ -571,6 +645,119 @@ app.delete('/api/orders/:id', requireSuperAdmin, auditAdminAction('order_delete'
   }
 });
 
+app.get('/api/wishlist/:userId', async (req, res) => {
+  try {
+    await connectToDatabase();
+    const wishlist = await Wishlist.findOne({ userId: req.params.userId }).populate('products').lean();
+    res.json(wishlist || { userId: req.params.userId, products: [] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/wishlist/toggle', async (req, res) => {
+  try {
+    await connectToDatabase();
+    const { userId, productId } = req.body;
+    let wishlist = await Wishlist.findOne({ userId });
+    if (!wishlist) {
+      wishlist = new Wishlist({ userId, products: [productId] });
+    } else {
+      const index = wishlist.products.indexOf(productId);
+      if (index > -1) {
+        wishlist.products.splice(index, 1);
+      } else {
+        wishlist.products.push(productId);
+      }
+    }
+    await wishlist.save();
+    res.json(wishlist);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/coupons/:code', async (req, res) => {
+  try {
+    await connectToDatabase();
+    const coupon = await Coupon.findOne({ 
+      code: req.params.code.toUpperCase(),
+      isActive: true 
+    }).lean();
+    if (!coupon) return res.status(404).json({ error: 'Coupon not found' });
+    res.json(coupon);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/coupons', requireSuperAdmin, async (_req, res) => {
+  try {
+    await connectToDatabase();
+    const coupons = await Coupon.find().sort({ createdAt: -1 }).lean();
+    res.json(coupons);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/coupons', requireSuperAdmin, auditAdminAction('coupon_create'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const { code, discountPercentage, isActive } = req.body;
+    const newCoupon = new Coupon({ 
+      code: code.toUpperCase(), 
+      discountPercentage, 
+      isActive 
+    });
+    await newCoupon.save();
+    res.status(201).json(newCoupon);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/coupons/:id', requireSuperAdmin, auditAdminAction('coupon_delete'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    await Coupon.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/admin/banners', requireSuperAdmin, async (_req, res) => {
+  try {
+    await connectToDatabase();
+    const banners = await Banner.find().sort({ order: 1 }).lean();
+    res.json(banners);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/banners', requireSuperAdmin, auditAdminAction('banner_create'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    const newBanner = new Banner(req.body);
+    await newBanner.save();
+    res.status(201).json(newBanner);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/banners/:id', requireSuperAdmin, auditAdminAction('banner_delete'), async (req, res) => {
+  try {
+    await connectToDatabase();
+    await Banner.findByIdAndDelete(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/upload', requireSuperAdmin, auditAdminAction('upload_create'), async (req, res, next) => {
   try {
     const upload = await getUploadMiddleware();
@@ -613,8 +800,8 @@ app.use((err, _req, res, _next) => res.status(500).json({ error: err.message || 
 
 if (!process.env.VERCEL) {
   const PORT = process.env.PORT || 3001;
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Backend server running on ${PORT}`);
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`Backend server with Socket.io running on ${PORT}`);
   });
 }
 
