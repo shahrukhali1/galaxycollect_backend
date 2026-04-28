@@ -24,7 +24,9 @@ const OrderSchema = new mongoose.Schema({
   total: { type: Number, required: true },
   status: { type: String, default: 'Pending', index: true },
   paymentMethod: { type: String, required: true },
-  shippingAddress: { type: ShippingAddressSchema, required: true }
+  shippingAddress: { type: ShippingAddressSchema, required: true },
+  couponCode: { type: String },
+  discountAmount: { type: Number, default: 0 }
 }, {
   timestamps: true
 });
