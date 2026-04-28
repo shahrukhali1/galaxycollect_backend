@@ -24,4 +24,4 @@ In frontend project env vars:
 ```bash
 VITE_API_BASE_URL=https://your-backend.vercel.app
 ```
-
+s
